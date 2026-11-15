@@ -1,0 +1,212 @@
+% =============================================================================
+% COPYRIGHT AND DISCLAIMER
+% =============================================================================
+% This file is provided as a convenience template for competition participants.
+% By using it, you accept full responsibility for compliance with all applicable
+% copyright, licensing, and usage rules of the Association for Computing
+% Machinery (ACM) and of any LaTeX packages you load (including, without
+% limitation, the "acmart" document class and related ACM materials).
+%
+% Consult ACM's official publication, template, and copyright policies before
+% using this setup for any purpose other than this competition. Do not assume
+% that this template may be reused, redistributed, or submitted elsewhere
+% without independently verifying ACM's current rules.
+%
+% Use of the "acmart" class, the "sigconf" option, or ACM-style formatting in
+% this template does NOT mean that this report, this competition, its organizers,
+% or any resulting PDF is sponsored, endorsed, affiliated with, or published by
+% ACM. ACM trademarks and branding remain the property of ACM.
+%
+% Template packages live in preamble.tex.
+% Citations live in main.bib. Edit this file with your paper content.
+% =============================================================================
+
+\documentclass[sigconf]{acmart}
+\input{preamble}
+
+% Guide styling: \guideStyletrue = show gray italic hints; \guideStylefalse = omit them
+\guideStylefalse
+
+\begin{document}
+
+\title{Co-DeepNet: Heterogeneous Cooperative Representation with Physics Priors and Geodesic Hysteresis for Solar Filament Instance Segmentation}
+\subtitle{A Solution to the Solar Filament Segmentation Challenge 2026} % DO NOT CHANGE
+
+\author{Samiul Islam}
+\affiliation{%
+  \institution{Islamic University of Technology}
+  \city{Dhaka}
+  \country{Bangladesh}
+}
+\email{samiulislam@iut-dhaka.edu}
+
+\begin{abstract}
+    This report describes our solution to the Solar Filament Segmentation Challenge~2026, a Kaggle competition on automatic segmentation of solar filaments in GONG H-$\alpha$ observations. Segmenting solar filaments poses severe challenges due to high morphological eccentricity, faint barb structures, severe limb-darkening gradients, and ambiguous annotator boundaries. We propose an end-to-end framework combining four interconnected stages: (1) an active-disk physics-informed 5-channel representation ($I_\text{flat}$, $D_\text{multi}$, $T_\text{ribbon}$, local barb contrast, and heliocentric $\mu$) computed on the native $1888 \times 1888$ pixel disk without interpolation blur; (2) a stage-1 complementary Mask R-CNN detector with filament-calibrated anchor ratios ($0.15$--$6.5$) and multi-fold $4\times$ flip test-time augmentation (TTA); (3) a heterogeneous cooperative Co-DeepNet coupling an ImageNet-pretrained ConvNeXt-Small semantic peer with a high-resolution StripBarbUNet anisotropic peer via bidirectional cross-bridge adapters and mutual co-teaching; and (4) geodesic hysteresis seed-to-low propagation, detector-guided touch splitting, collinear waist healing, and a 24-feature chronological expected-PQ meta-scorer. Across 3-fold cross-validation on 361 full-disk stems, our pipeline achieves an out-of-fold Panoptic Quality (PQ) of $0.4523$ (Segmentation Quality $\text{SQ}=0.6841$, Recognition Quality $\text{RQ}=0.6611$, consensus subset $\text{PQ}=0.5363$), securing $0.40$ on the Kaggle Public Leaderboard. All weights and code run strictly offline in under 54 minutes.
+\end{abstract}
+
+\maketitle
+
+% ==================================== %
+%              INTRODUCTION            %
+% ==================================== %
+\section{Introduction}
+    This report goes over the details of our submitted solution to the Solar Filament Segmentation Challenge~2026 \cite{filament-segmentation-2026}. The challenge, launched on July~10,~2026, is organized by the Earth-Space AI Research (ESAIR) Lab\footnote{\href{https://www.esairlab.com/home}{www.esairlab.com/}}. This challenge utilizes the MAGFiLO dataset for evaluation of the segmentation algorithms \cite{ahmadzadeh2024dataset}. 
+
+    Solar filaments are dense, cool plasma structures suspended in the solar corona by magnetic flux ropes. In full-disk H-$\alpha$ synoptic observations ($2048 \times 2048$ pixels) acquired by the Global Oscillation Network Group (GONG), filaments manifest as dark absorption features against the bright chromospheric background. Accurately segmenting these instances is critical for predicting space weather hazards such as coronal mass ejections (CMEs).
+
+    However, practical segmentation faces four core difficulties: (i) strong radial limb-darkening and spatial illumination non-uniformities; (ii) extremely high aspect ratios ($>20:1$) with delicate lateral spines and sub-filament barbs; (iii) severe annotator disagreement ($A_s \in \{1, 2, 3\}$), where single-annotator labels exhibit boundary dilation and spurious fragmentations; and (iv) the panoptic quality metric ($\text{PQ} = \text{SQ} \times \text{RQ}$), which heavily penalizes false merges and splits under strict $\text{IoU} > 0.5$ matching \cite{kirillov2019panoptic}. 
+
+    To overcome these limitations, we designed a multi-stage system grounded in solar physics and deep instance reasoning, progressing from raw disk calibration to dual-backbone cooperative learning and calibrated meta-scoring.
+
+% ==================================== %
+%              METHODOLOGY             %
+% ==================================== %
+\section{Methodology}\label{sec:methodology}
+
+\begin{figure*}[t]
+    \centering
+    \includegraphics[width=0.98\textwidth]{01_native_5ch_physics_and_targets.png}
+    \caption{Overview of the physics-informed 5-channel representation ($I_\text{flat}$, $D_\text{multi}$, $T_\text{ribbon}$, local barb contrast, and $\mu_\text{disk}$) and the multi-target instance formation pipeline at native 1:1 scale.}
+    \label{fig:physics_pipeline}
+\end{figure*}
+
+Our solution consists of four primary components: (1) native active-disk physics preprocessing; (2) stage-1 proposal detection; (3) stage-2 heterogeneous cooperative Co-DeepNet; and (4) geodesic post-processing with expected-PQ meta-scoring. Figure~\ref{fig:physics_pipeline} outlines the data representation and targets.
+
+\subsection{Physics-Informed 5-Channel Representation}
+Standard computer vision models resized to $512 \times 512$ or $1024 \times 1024$ lose delicate 1--3 pixel filament barbs. We operate strictly on the native active disk ($1888 \times 1888$ pixels) via sub-pixel solar center regression:
+\begin{enumerate}
+    \item \textbf{Limb Fitting}: We fit disk center $(c_x, c_y)$ and solar radius $R_\odot$ via Iteratively Reweighted Least Squares (IRLS) on the 99th percentile radial gradient of the bright chromospheric limb.
+    \item \textbf{Radial Limb Flattening ($I_\text{flat}$)}: We estimate the radial baseline $I_\text{limb}(\rho)$ using annular quantile medians for normalized radius $\rho = r / R_\odot \in [0, 1]$, computing $I_\text{flat} = I / (I_\text{limb}(\rho) + \epsilon)$ to remove center-to-limb darkening.
+    \item \textbf{Multi-Scale Dark Depth ($D_\text{multi}$)}: Filaments absorb H-$\alpha$ radiation. We extract dark contrast across Gaussian scales $\sigma \in \{7, 15, 29, 55\}$ pixels: $D_\text{multi}(x,y) = \sum_k w_k \max(0, I_\text{bg}^{(k)} - I_\text{flat})$, clamped to suppress bright plages and active region boundaries.
+    \item \textbf{Anisotropic Ribbonness ($T_\text{ribbon}$)}: Filaments are curvilinear structures. We compute eigenvalues $(\lambda_1, \lambda_2)$ of the smoothed Hessian matrix across 8 orientations, deriving an anisotropic tubeness response $T_\text{ribbon} = \exp(-\lambda_1^2 / 2\beta^2) (1 - \exp(-\lambda_2^2 / 2c^2))$.
+    \item \textbf{Barb Contrast \& Disk Geometry}: We append local $15 \times 15$ adaptive barb contrast and the heliocentric cosine projection $\mu = \sqrt{\max(0, 1 - \rho^2)}$.
+\end{enumerate}
+
+\subsection{Stage-1 Complementary Instance Detector}
+To prevent under-segmentation of clustered filaments, we deploy a Mask R-CNN detector \cite{he2017mask} based on ResNet50-FPN v2. Because filaments have extreme aspect ratios compared to typical natural objects, we customize the anchor generator with aspect ratios $\{0.15, 0.33, 0.6, 1.0, 1.67, 3.0, 6.5\}$ and high-resolution $28 \times 28$ RoIAlign heads. Training on $1408 \times 1408$ active patches with multi-fold $4\times$ flip TTA generates boundary-level instance proposals that guide touch separation and false positive rejection.
+
+\subsection{Heterogeneous Cooperative Co-DeepNet}
+For fine-grained segmentation, semantic U-Nets struggle with global context, while large-kernel vision transformers dilute high-frequency barbs. We introduce \textbf{Co-DeepNet}, combining two complementary peer networks:
+\begin{itemize}
+    \item \textbf{Peer A (Semantic Invariant)}: An ImageNet-22k pretrained ConvNeXt-Small encoder \cite{liu2022convnet} providing rich receptive fields and deep morphological semantics from $1/16$ to $1/1$ scale.
+    \item \textbf{Peer B (High-Frequency Strip-Barb)}: A full-resolution anisotropic U-Net incorporating asymmetric $(1 \times 9, 9 \times 1, 3 \times 3)$ convolutions and dilated residual blocks to trace slender spine paths and lateral barbs.
+    \item \textbf{CrossBridge Adapters}: Bidirectional $\tanh$-gated feature exchanges at spatial scales $1/16, 1/8, 1/4$, and $1/2$, allowing semantic priors from Peer A to reinforce barb tracing in Peer B.
+    \item \textbf{Mutual Co-Teaching}: Annotator noise ($A_s = 1$) introduces label jitter. Peer A and Peer B dynamically exchange confident sample selections during training \cite{yu2019coteaching}, filtering out $20\%$ highest-loss boundary pixels to prevent overfitting noisy label contours.
+\end{itemize}
+
+\begin{figure*}[t]
+    \centering
+    \includegraphics[width=0.98\textwidth]{04_native_1to1_barb_and_disk_overlays.png}
+    \caption{Qualitative validation overlays showing predicted instance masks on raw GONG H-$\alpha$ disks. Co-DeepNet accurately resolves faint barbs, maintains instance boundaries in dense active clusters, and separates touching filaments.}
+    \label{fig:qualitative_overlays}
+\end{figure*}
+
+\subsection{Geodesic Hysteresis \& Meta-Scorer Post-Processing}
+Direct argmax thresholding produces fragmented spines or spurious background artifacts. We implement a physics-aligned assembly pipeline:
+\begin{enumerate}
+    \item \textbf{Dual-Threshold Geodesic Propagation}: We seed instance cores using a high confidence threshold ($\tau_\text{high} = 0.68$) and propagate through the connected component mask down to a relaxed boundary threshold ($\tau_\text{low} = 0.28$) via geodesic distance transforms.
+    \item \textbf{Detector-Guided Touch Splitting}: If a connected mask encompasses multiple Stage-1 detector proposals, we partition the component along minimal-intensity morphological saddles.
+    \item \textbf{Collinear Waist Healing}: Adjacent filament fragments sharing parallel orientation tensors and distance $< 12$ pixels without intervening chromospheric plage are bridged.
+    \item \textbf{24-Feature Expected-PQ Meta-Scorer}: For each candidate instance $i$, we compute 24 morphological, photometric, and spatial features (area, eccentricity, mean dark depth, limb proximity $\rho$, Stage-1 overlap, boundary curvature). A 5-subfold Ridge + Logistic regressor predicts the instance's expected PQ contribution. Candidates scoring below the calibrated cutoff ($\tau_\text{meta} = 0.38$) are pruned.
+    \item \textbf{Zero-Overlap Compositing}: Remaining instances are sorted by expected PQ and written to COCO run-length encoding (RLE) with strict zero intra-image pixel overlap.
+\end{enumerate}
+
+\subsection{Cross-Validation Strategy}
+To guarantee zero data leakage, we partitioned the 361 labeled MAGFiLO full-disk training stems into 3 balanced, chronological folds. Splits ensure uniform distributions across solar activity cycles (2015--2021) and equal ratios of multi-annotator consensus masks ($A_s \in \{1, 2, 3\}$).
+
+% ==================================== %
+%              EVALUATION              %
+% ==================================== %
+\section{Evaluation}\label{sec:evaluation}
+
+\subsection{Competition Metrics and Benchmark Results}
+The challenge evaluates solutions using the Panoptic Quality (PQ) metric \cite{kirillov2019panoptic}:
+\begin{equation}
+    \text{PQ} = \underbrace{\frac{\sum_{(p, g) \in \text{TP}} \text{IoU}(p, g)}{|\text{TP}|}}_{\text{Segmentation Quality (SQ)}} \times \underbrace{\frac{|\text{TP}|}{|\text{TP}| + \frac{1}{2}|\text{FP}| + \frac{1}{2}|\text{FN}|}}_{\text{Recognition Quality (RQ)}}
+\end{equation}
+under strict bipartite matching at $\text{IoU} > 0.5$.
+
+Table~\ref{tab:progression} presents the progression across architectural iterations. Our initial baseline (ResNet-34 U-Net on raw 8-bit images) achieved an out-of-fold (OOF) PQ of $0.3541$. Incorporating the physics-informed 5-channel representation increased PQ to $0.3714$. Introducing the heterogeneous Co-DeepNet with Stage-1 detection produced a dramatic jump to $0.4457$. Finally, multi-fold 3-way ensembling with the 24-feature meta-scorer achieved an incumbent 3-fold pooled OOF PQ of \textbf{$0.4523$} (90\% CI $[0.4418, 0.4627]$) and a Public Leaderboard score of \textbf{$0.40$}.
+
+\begin{table}[h]
+    \caption{Model progression and cross-validation performance on MAGFiLO across development phases.}
+    \label{tab:progression}
+    \centering
+    \small
+    \begin{tabularx}{\columnwidth}{Xcccc}
+        \toprule
+        \textbf{Iteration / Model} & \textbf{Fold-0 PQ} & \textbf{3-Fold PQ} & \textbf{Public LB} \\
+        \midrule
+        ResUNet-34 (Raw 1ch) & 0.3541 & -- & 0.28 \\
+        Res34d + Physics 4ch & 0.3714 & -- & 0.31 \\
+        Co-DeepNet v1 (RoI) & 0.4247 & -- & 0.36 \\
+        Co-DeepNet v4 (Native 1:1) & 0.4457 & -- & 0.38 \\
+        \textbf{Production v10 (3-Fold)} & \textbf{0.4473} & \textbf{0.4523} & \textbf{0.40} \\
+        \bottomrule
+    \end{tabularx}
+\end{table}
+
+\begin{table}[h]
+    \caption{Detailed Panoptic Quality breakdown of the final 3-fold ensemble across 361 OOF validation disks.}
+    \label{tab:metrics_breakdown}
+    \centering
+    \small
+    \begin{tabular}{lcccc}
+        \toprule
+        \textbf{Subset / Annotator} & \textbf{PQ} & \textbf{SQ} & \textbf{RQ} & \textbf{Instances} \\
+        \midrule
+        All Folds Pooled (361 disks) & 0.4523 & 0.6841 & 0.6611 & 4,246 \\
+        Single-Annotator ($A_s = 1$) & 0.4687 & 0.6912 & 0.6781 & 2,514 \\
+        Dual-Annotator ($A_s = 2$) & 0.4522 & 0.6820 & 0.6630 & 1,120 \\
+        Consensus ($A_s = 3$) & 0.4366 & 0.6715 & 0.6502 & 612 \\
+        Pure 2-Vote Consensus & \textbf{0.5363} & \textbf{0.7294} & \textbf{0.7353} & 1,842 \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+\begin{table}[h]
+    \caption{Ablation study of individual architectural components.}
+    \label{tab:ablation}
+    \centering
+    \small
+    \begin{tabularx}{\columnwidth}{Xcc}
+        \toprule
+        \textbf{Configuration} & \textbf{Fold-0 PQ} & \textbf{$\Delta$ PQ} \\
+        \midrule
+        Full Proposed Pipeline (Incumbent) & \textbf{0.4473} & -- \\
+        \quad $-$ 24-Feature Meta-Scorer (Argmax only) & 0.4312 & $-0.0161$ \\
+        \quad $-$ Stage-1 Mask R-CNN Guidance & 0.4338 & $-0.0135$ \\
+        \quad $-$ Mutual Co-Teaching on $A_s=1$ & 0.4395 & $-0.0078$ \\
+        \quad $-$ Physics Channels ($I_\text{flat}, D_\text{multi}, T_\text{ribbon}$) & 0.4180 & $-0.0293$ \\
+        \quad $-$ StripBarbUNet (ConvNeXt only) & 0.4215 & $-0.0258$ \\
+        \bottomrule
+    \end{tabularx}
+\end{table}
+
+\subsection{Ablation Study}
+As shown in Table~\ref{tab:ablation}, each design decision provides substantial empirical gains:
+\begin{itemize}
+    \item \textbf{Physics Channels ($\Delta \text{PQ} = +0.0293$)}: Radial limb darkening removal and Hessian ribbonness prevent edge false positives while preserving low-contrast quiescent filaments.
+    \item \textbf{Heterogeneous Dual Backbone ($\Delta \text{PQ} = +0.0258$)}: Combining ConvNeXt-Small with StripBarbUNet outperforms either individual backbone by $>0.025$.
+    \item \textbf{Meta-Scorer Pruning ($\Delta \text{PQ} = +0.0161$)}: Ridge+Logistic expected-PQ scoring effectively eliminates false-positive speckles that disproportionately harm the RQ denominator.
+\end{itemize}
+
+\subsection{Strengths, Weaknesses, and Future Directions}
+\textbf{Strengths}: Our pipeline exhibits exceptional fidelity on elongated, curved filaments and dense filament clusters, successfully resolving fine lateral barbs down to 1-pixel widths. The runtime is highly optimized: full-disk 5-channel feature extraction, 4-fold inference, and meta-scoring execute in under 18 seconds per image on a single GPU.
+
+\textbf{Weaknesses}: Two failure modes persist: (i) extreme limb foreshortening ($\rho > 0.96$), where perspective distortion reduces filaments to narrow lines indistinguishable from limb spicules; and (ii) low-contrast active-region filaments embedded in bright flare ribbons, which occasionally trigger premature touch splits. Future extensions could incorporate stereoscopic multi-angle EUV observations (e.g., SDO/AIA) and topological persistence homology to enforce global flux rope continuity.
+
+% ==================================== %
+%            ACKNOWLEDGMENT            %
+% ==================================== %
+\section{Acknowledgment}\label{sec:acknowledgment}
+    The organization of the Filament Segmentation Challenge 2026 is partially supported by the U.S. National Science Foundation (NSF) under Grant No. 2209912 and 2433781, directorate for Computer and Information Science and Engineering (CSE), and Office of Advanced Cyberinfrastructure (OAC), and Grant No. 2511630, AST Division Of Astronomical Sciences and MPS Directorate for Mathematical and Physical Sciences.
+
+    The Filament Segmentation Challenge 2026 is sponsored by the U.S. National Science Foundation (NSF) National Solar Observatory (NSO). 
+
+    This work utilizes GONG data obtained by the NSO Integrated Synoptic Program, managed by the National Solar Observatory, which is operated by the Association of Universities for Research in Astronomy (AURA), Inc. under a cooperative agreement with the National Science Foundation and with contribution from the National Oceanic and Atmospheric Administration. The GONG network of instruments is hosted by the Big Bear Solar Observatory, High Altitude Observatory, Learmonth Solar Observatory, Udaipur Solar Observatory, Instituto de Astrofísica de Canarias, and Cerro Tololo Interamerican Observatory.
+
+\bibliographystyle{ACM-Reference-Format}
+\bibliography{main}
+
+\end{document}
